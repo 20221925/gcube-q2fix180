@@ -1,0 +1,11 @@
+ultralytics
+opencv-python-headless
+rasterio
+shapely
+pandas
+numpy
+tqdm
+scikit-learn
+matplotlib
+jupyterlab
+ipywidgets
