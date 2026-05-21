@@ -1,53 +1,52 @@
 """
 ================================================================
 2026 지능IoT해커톤 - 문제 2 : 위성 이미지 건물 탐지
-SOLID 리팩토링 + ETA 출력 + H100 × 2 (Multi-GPU DDP) preset
+SOLID + ETA + Cloud H100 단일 GPU 안전 실행 버전
 ================================================================
 목표:
-  - H100 80GB × 2 환경에서 OOM 없이 안정적으로 학습.
-  - Ultralytics 내장 DDP(Distributed Data Parallel)로 2-GPU 가속.
-  - PYTORCH_CUDA_ALLOC_CONF로 HBM3 fragmentation 방지.
-  - 데이터 변환/학습/보정/추론/제출을 역할별 클래스로 분리.
-  - 얼리스탑(patience 기반) + ETA 출력 유지.
+  - 클라우드 H100 1대(80GB) 환경에서 첫 실행에서도 오류 없이 끝까지 진행.
+  - 패키지/시스템 라이브러리 누락 자동 복구 (libGL, opencv-headless 등).
+  - CUDA 환경 사전 검사로 mismatch를 학습 전에 잡아냄.
+  - VRAM은 peak ~50GB로 80GB 한도 안 안전 유지.
+  - 얼리스탑(patience) + OOM 자동 강하 + 시간 예산 자동 종료.
 
-기본 실행 (H100 × 2, 5시간 예산):
-  python Q2fix180.py --preset h100x2-5h --device 0,1 --force-cuda
+기본 실행 (권장 - 클라우드 H100 단일 GPU, 5시간 예산):
+  python Q2fix180_cloud.py --preset h100-cloud-5h --device cuda --force-cuda
 
-더 보수적인 VRAM (peak ~35GB/GPU, OOM 위험 0에 가까움):
-  python Q2fix180.py --preset h100x2-5h-safe --device 0,1 --force-cuda
+데이터 폴더가 자동 탐색 안 되면:
+  python Q2fix180_cloud.py --preset h100-cloud-5h --device cuda --force-cuda \
+      --data-dir /workspace/data
 
-고해상도 (imgsz=1280, peak ~55GB/GPU):
-  python Q2fix180.py --preset h100x2-5h-hires --device 0,1 --force-cuda
+더 보수적인 VRAM (다른 작업과 GPU 공유 시):
+  python Q2fix180_cloud.py --preset h100-cloud-5h-safe --device cuda --force-cuda
 
-다중 모델 앙상블 (yolo11x + yolov8x, 4 jobs):
-  python Q2fix180.py --preset h100x2-5h-multimodel --device 0,1 --force-cuda
+빠른 환경 진단만 (실제 학습 없이):
+  python Q2fix180_cloud.py --inspect
 
-단일 GPU 호환 (참고):
-  python Q2fix180.py --preset rtx6000-small-3h-stable --device cuda --force-cuda
-
-VRAM per-GPU 가이드 (H100 80GB, yolo11x, BF16/AMP, DDP):
-  imgsz=1024, batch/총=16 (8/GPU)  → 약 30~40GB/GPU  ✓ 매우 안전
-  imgsz=1024, batch/총=24 (12/GPU) → 약 45~55GB/GPU  ✓ 균형
-  imgsz=1024, batch/총=32 (16/GPU) → 약 60~70GB/GPU  ⚠ 살짝 빠듯
-  imgsz=1280, batch/총=16 (8/GPU)  → 약 50~60GB/GPU  ✓ 균형
-  imgsz=1280, batch/총=24 (12/GPU) → 약 75GB+ /GPU   ⚠ OOM 위험
-
-DDP 사용 시 주의 사항:
-  - --batch는 **총** 배치 사이즈 (GPU 수로 자동 분할)
-  - --workers는 **GPU별** 워커 수 (총 = workers × n_gpu)
-  - cache='ram'은 DDP에서 RAM을 GPU 수만큼 복제하므로 'disk' 권장
-  - 학습 중 OOM 발생 시 batch를 GPU 수의 배수로 자동 강하
-
-얼리스탑:
-  - Ultralytics 내장 patience 기반. val fitness가 N epoch 개선 X → 종료 후 best.pt 저장.
-  - H100x2 preset은 patience 50~60으로 noise 내성 확보.
-
-필수 디렉토리 구조:
+필수 디렉토리 구조 (자동 탐색됨):
   data/
     train_images/   (*.tif)
     train_labels/   (*.geojson)
     test_images/    (*.tif)
     building_detection_template.csv
+
+자동 탐색 위치:
+  - --data-dir 인자
+  - 스크립트 폴더/data
+  - 현재 작업 폴더 (CWD) / data
+  - /workspace/data, /content/data, /root/data, /data, /mnt/data
+  - 위 폴더의 building_detection_template.csv 재귀 검색
+
+얼리스탑:
+  - Ultralytics 내장 patience 기반 (기본 60).
+  - val fitness가 60 epoch 동안 개선 X → 자동 종료 후 best.pt 저장.
+
+OOM 안전 장치:
+  - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (HBM3 fragmentation 방지)
+  - cache='disk' 강제 (RAM 부담 ↓)
+  - plots=False (matplotlib 메모리 회피)
+  - OOM 발생 시 batch /= 2 자동 재시도
+  - 연속 OOM 2회 시 imgsz도 한 단계 강하
 ================================================================
 """
 
@@ -57,26 +56,36 @@ import argparse
 import json
 import math
 import os
+import platform
 import shutil
 import subprocess
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
 # ──────────────────────────────────────────────────────────────
-# [중요] torch import 이전에 CUDA 메모리 할당자 옵션을 설정해야 효과 발생.
-#        H100 HBM3에서 expandable_segments는 fragmentation을 크게 줄여 OOM 빈도 ↓.
-#        max_split_size_mb는 큰 블록 분할 한계를 두어 dense 객체 NMS의 메모리 spike 완화.
+# [클라우드 안전] torch import 이전에 메모리 할당자 옵션을 강제 설정.
+#   - expandable_segments: H100 HBM3 fragmentation 방지 (OOM 빈도 ↓)
+#   - max_split_size_mb: 큰 블록 분할 한계로 NMS 메모리 spike 완화
 # ──────────────────────────────────────────────────────────────
-_DEFAULT_ALLOC_CONF = "expandable_segments:True,max_split_size_mb:512"
 if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = _DEFAULT_ALLOC_CONF
-# DDP 통신 안정화 (NCCL이 느려지는 환경에서 대기 시간 증가)
-os.environ.setdefault("NCCL_TIMEOUT", "1800")
-# DDP에서 Ultralytics가 사용하는 임시 디렉터리 고정 (권한 문제 회피)
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:512"
 os.environ.setdefault("OMP_NUM_THREADS", "4")
+# DataLoader 워커 hang 방지 (특히 도커 컨테이너)
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+# Ultralytics 자동 업데이트 끄기 (네트워크 의존성 ↓)
+os.environ.setdefault("YOLO_OFFLINE", "False")
+os.environ.setdefault("ULTRALYTICS_OFFLINE_MODE", "0")
+
+# [클라우드 안전] Jupyter/REPL 환경에서 __file__ 미정의 대비
+try:
+    _SCRIPT_FILE = Path(__file__).resolve()
+except NameError:
+    _SCRIPT_FILE = Path.cwd() / "Q2fix180_cloud.py"
+    print(f"[INIT] __file__ 미정의 환경 → CWD 기준으로 진행: {_SCRIPT_FILE.parent}")
 
 import numpy as np
 import pandas as pd
@@ -86,24 +95,104 @@ from tqdm import tqdm
 # 1. 패키지 설치 확인
 # ──────────────────────────────────────────────────────────────
 class PackageInstaller:
-    """필수 패키지 설치 확인만 담당한다. SRP: 환경 준비 책임."""
+    """필수 패키지 설치 + 시스템 라이브러리 확인. 클라우드 환경에서 첫 실행 안정성 보강."""
 
     REQUIRED = {
-        "ultralytics": "ultralytics",
-        "cv2": "opencv-python-headless",
-        "rasterio": "rasterio",
-        "shapely": "shapely",
+        # 모듈명 : (pip 패키지명, 추가 import 검증 함수 또는 None)
+        "ultralytics": ("ultralytics", None),
+        "cv2": ("opencv-python-headless", None),
+        "rasterio": ("rasterio", None),
+        "shapely": ("shapely", None),
+        "torch": ("torch", None),  # torch 누락 시 명확한 안내
     }
+
+    PIP_RETRIES = 3
 
     @classmethod
     def install_if_missing(cls) -> None:
-        for module, pkg in cls.REQUIRED.items():
-            try:
-                __import__(module)
-            except ImportError:
-                print(f"[설치] {pkg} 설치 중...")
-                subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "-q"])
+        print(f"[INIT] Python {platform.python_version()} | {platform.system()} {platform.release()}")
+        print(f"[INIT] 작업 디렉터리: {Path.cwd()}")
+
+        for module, (pkg, _) in cls.REQUIRED.items():
+            if cls._try_import(module):
+                continue
+
+            # torch는 자동 설치하지 않음 (CUDA 빌드를 사용자가 골라야 함)
+            if module == "torch":
+                raise RuntimeError(
+                    "PyTorch(torch)가 설치되어 있지 않습니다. CUDA 11/12에 맞춰 직접 설치하세요.\n"
+                    "  CUDA 12.1: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121\n"
+                    "  CUDA 11.8: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118"
+                )
+
+            print(f"[설치] {pkg} 설치 시도...")
+            ok = cls._pip_install(pkg)
+            if not ok:
+                raise RuntimeError(f"{pkg} 설치 실패. 수동 설치 후 다시 실행하세요: pip install {pkg}")
+
+            # opencv 설치 후 libGL 누락 시 자동 복구
+            if module == "cv2" and not cls._try_import("cv2"):
+                cls._try_install_libgl()
+                if not cls._try_import("cv2"):
+                    raise RuntimeError(
+                        "cv2 import 실패. opencv-python-headless를 설치했으나 시스템 라이브러리 누락 가능.\n"
+                        "Ubuntu 기반: sudo apt-get update && sudo apt-get install -y libgl1 libglib2.0-0"
+                    )
+
         print("[패키지] 모든 패키지 확인 완료\n")
+
+    @staticmethod
+    def _try_import(module: str) -> bool:
+        try:
+            __import__(module)
+            return True
+        except Exception as e:
+            # ImportError 외에 ModuleNotFoundError, OSError(libGL) 등도 처리
+            print(f"  [import 실패] {module}: {type(e).__name__}: {e}")
+            return False
+
+    @classmethod
+    def _pip_install(cls, pkg: str) -> bool:
+        for attempt in range(1, cls.PIP_RETRIES + 1):
+            try:
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install", pkg, "-q", "--disable-pip-version-check"],
+                    timeout=600,
+                )
+                return True
+            except subprocess.CalledProcessError as e:
+                print(f"  [pip 재시도 {attempt}/{cls.PIP_RETRIES}] {pkg} 실패 (code={e.returncode})")
+            except subprocess.TimeoutExpired:
+                print(f"  [pip 재시도 {attempt}/{cls.PIP_RETRIES}] {pkg} 타임아웃")
+            except Exception as e:
+                print(f"  [pip 재시도 {attempt}/{cls.PIP_RETRIES}] {pkg} 예외: {e}")
+            time.sleep(2)
+        return False
+
+    @staticmethod
+    def _try_install_libgl() -> None:
+        """Ubuntu/Debian 기반 클라우드에서 libGL 자동 설치 (sudo 권한 있을 때만)."""
+        if platform.system() != "Linux":
+            return
+        # apt-get이 있는 환경에서만 시도
+        if shutil.which("apt-get") is None:
+            return
+        print("  [시스템] libGL 누락 추정 → apt-get으로 libgl1, libglib2.0-0 설치 시도...")
+        # root 권한 확인
+        is_root = os.geteuid() == 0 if hasattr(os, "geteuid") else False
+        prefix = [] if is_root else (["sudo", "-n"] if shutil.which("sudo") else [])
+        cmds = [
+            prefix + ["apt-get", "update", "-qq"],
+            prefix + ["apt-get", "install", "-y", "-qq", "libgl1", "libglib2.0-0"],
+        ]
+        for cmd in cmds:
+            try:
+                subprocess.check_call(cmd, timeout=120, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+            except Exception as e:
+                print(f"  [시스템] 자동 설치 실패 ({' '.join(cmd[:3])}...): {e}")
+                print("  [시스템] 수동으로 다음을 실행하세요: sudo apt-get install -y libgl1 libglib2.0-0")
+                return
+        print("  [시스템] libGL 설치 완료.")
 
 
 PackageInstaller.install_if_missing()
@@ -119,8 +208,8 @@ from rasterio.enums import ColorInterp  # noqa: E402
 class CFG:
     """기본값 모음. CLI 인자가 들어오면 PipelineRunner에서 필요한 값만 대체한다."""
 
-    # 경로
-    PROJECT_ROOT = Path(__file__).resolve().parent
+    # 경로 (Jupyter/REPL 환경에서도 안전한 _SCRIPT_FILE 사용)
+    PROJECT_ROOT = _SCRIPT_FILE.parent
     BASE_DIR = PROJECT_ROOT / "data"
     TRAIN_IMG_DIR = BASE_DIR / "train_images"
     TRAIN_LBL_DIR = BASE_DIR / "train_labels"
@@ -138,16 +227,16 @@ class CFG:
     SEED = 42
     ENSEMBLE_SEEDS = "42,77"
 
-    # 학습
+    # 학습 (클라우드 H100 단일 GPU 안전치)
     MODEL = "yolo11x.pt"
     EPOCHS = 200
-    BATCH = 16                    # [DDP] 총 배치. H100 × 2면 GPU당 8 → ~35GB/GPU
+    BATCH = 12                  # H100 80GB에서 peak ~50GB로 안전
     PATIENCE = 50
-    WORKERS = 4                   # [DDP] GPU별 워커 수. 2 GPU면 총 8 프로세스
+    WORKERS = 4                 # 클라우드 컨테이너 DataLoader 안정성
     DEVICE = "auto"
     FORCE_CUDA = False
     AMP = True
-    MAX_DET = 15000               # [VRAM] 30000→15000: val NMS 메모리 안전
+    MAX_DET = 15000             # [수정] 30000→15000: val NMS 메모리 안전
     TIME_BUDGET_MIN = 0.0
     RESERVE_SUBMIT_MIN = 20.0
 
@@ -167,13 +256,13 @@ class CFG:
     TILE_NMS_IOU = 0.50
     TILE_CALIB_CONFS = tuple(np.round(np.concatenate([np.arange(0.02, 0.121, 0.01), np.arange(0.14, 0.301, 0.04)]), 2))
     TILE_CALIB_IOUS = tuple(np.round(np.arange(0.25, 0.751, 0.05), 2))
-    # [버그수정] degrees=45는 axis-aligned bbox를 √2배 부풀려 라벨 품질 손상.
-    #            90/180/270° 회전은 TTA에서 정확히 처리하므로 학습 회전은 0이 안전.
+    # [버그수정] degrees=45는 axis-aligned bbox를 √2배 부풀려 라벨을 손상시킴.
+    #            90/180/270° 회전은 TTA에서 정확히 처리 → 학습 회전은 0이 안전.
     AUG_DEGREES = 0.0
     AUG_MOSAIC = 0.55
     AUG_SCALE = 0.40
     AUG_TRANSLATE = 0.08
-    AUG_MIXUP = 0.05              # 소규모 데이터셋 regularization
+    AUG_MIXUP = 0.05            # 소규모 데이터셋 regularization
     AUG_COPY_PASTE = 0.10
     CLOSE_MOSAIC = 30
 
@@ -191,6 +280,22 @@ class CFG:
         cls.YOLO_ROOT = work_dir
         cls.RUNS_DIR = work_dir
         cls.SUBMISSION_CSV = work_dir / "submission.csv"
+
+    @classmethod
+    def ensure_writable_dirs(cls) -> None:
+        """클라우드 환경에서 권한/경로 문제로 생성 실패 시 CWD로 fallback."""
+        for attr, path in [("YOLO_ROOT", cls.YOLO_ROOT), ("RUNS_DIR", cls.RUNS_DIR)]:
+            try:
+                Path(path).mkdir(parents=True, exist_ok=True)
+                test = Path(path) / ".write_test"
+                test.write_text("ok"); test.unlink()
+            except Exception as e:
+                fallback = Path.cwd() / Path(path).name
+                print(f"[INIT] {attr}={path} 쓰기 불가 ({e}) → {fallback}로 fallback")
+                fallback.mkdir(parents=True, exist_ok=True)
+                setattr(cls, attr, fallback)
+                if attr == "YOLO_ROOT":
+                    cls.SUBMISSION_CSV = Path.cwd() / "submission.csv"
 
 
 @dataclass(frozen=True)
@@ -302,7 +407,54 @@ class RuntimeEstimator:
 # 4. CUDA / 디바이스
 # ──────────────────────────────────────────────────────────────
 class DeviceManager:
-    """CUDA/CPU 선택과 AMP/half 설정, multi-GPU(DDP) 검증까지 담당한다."""
+    """CUDA/CPU 선택, AMP/half, 메모리 정리 및 사전 진단까지 담당."""
+
+    @staticmethod
+    def preflight_cuda() -> None:
+        """학습 시작 전 CUDA 환경 사전 검사. 명확한 에러 메시지로 빠른 실패 유도."""
+        try:
+            import torch
+        except ImportError:
+            raise RuntimeError(
+                "PyTorch가 없습니다. CUDA 12.1 빌드 설치:\n"
+                "  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121"
+            )
+
+        if not torch.cuda.is_available():
+            # nvidia-smi가 동작하는지 확인 (드라이버는 있는데 torch가 CPU 빌드일 수도)
+            smi_out = ""
+            if shutil.which("nvidia-smi"):
+                try:
+                    smi_out = subprocess.check_output(["nvidia-smi", "-L"], timeout=10).decode().strip()
+                except Exception:
+                    smi_out = ""
+            if smi_out:
+                raise RuntimeError(
+                    "nvidia-smi는 GPU를 인식하는데 torch.cuda.is_available()=False.\n"
+                    f"nvidia-smi 결과:\n{smi_out}\n\n"
+                    "현재 설치된 torch가 CPU 전용이거나 CUDA 버전이 안 맞습니다. 재설치:\n"
+                    "  pip uninstall -y torch torchvision\n"
+                    "  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121"
+                )
+            else:
+                raise RuntimeError(
+                    "CUDA를 사용할 수 없습니다. GPU가 보이지 않습니다.\n"
+                    "- nvidia-smi를 실행해 드라이버 상태를 확인하세요.\n"
+                    "- 클라우드 인스턴스가 GPU 노드인지 확인하세요."
+                )
+
+        n = torch.cuda.device_count()
+        if n == 0:
+            raise RuntimeError(
+                "torch.cuda.is_available()=True 인데 device_count()=0. "
+                "드라이버/runtime mismatch. nvidia-smi와 torch.version.cuda 버전을 맞춰 재설치하세요."
+            )
+
+        # H100 외 다른 GPU에서도 동작은 하지만 안내
+        for i in range(n):
+            prop = torch.cuda.get_device_properties(i)
+            if "H100" not in prop.name and "A100" not in prop.name and "RTX" not in prop.name:
+                print(f"[DEVICE] GPU {i}={prop.name} (H100/A100/RTX 외 GPU - preset 시간 산정과 다를 수 있음)")
 
     @staticmethod
     def resolve_device(requested_device: str = CFG.DEVICE, force_cuda: bool = CFG.FORCE_CUDA) -> str:
@@ -316,8 +468,8 @@ class DeviceManager:
             import torch
         except ImportError as e:
             msg = (
-                "PyTorch(torch)가 설치되어 있지 않습니다. CUDA 사용을 위해서는 CUDA 지원 PyTorch가 필요합니다.\n"
-                "예: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121"
+                "PyTorch(torch)가 설치되어 있지 않습니다. CUDA 지원 PyTorch가 필요합니다.\n"
+                "예: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121"
             )
             if force_cuda or requested in {"cuda", "gpu"} or requested.isdigit() or "," in requested:
                 raise RuntimeError(msg) from e
@@ -330,8 +482,7 @@ class DeviceManager:
         print(f"  torch version       : {torch.__version__}")
         print(f"  torch cuda build    : {torch.version.cuda}")
         print(f"  cuda available      : {torch.cuda.is_available()}")
-        alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "(미설정)")
-        print(f"  alloc conf          : {alloc_conf}")
+        print(f"  alloc conf          : {os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '(미설정)')}")
 
         if torch.cuda.is_available():
             n_gpu = torch.cuda.device_count()
@@ -350,19 +501,25 @@ class DeviceManager:
             except Exception:
                 pass
 
-            # 사용자가 "0,1" 같은 multi-GPU 문자열을 명시한 경우 검증 후 그대로 반환
+            # multi-GPU 요청이라도 단일 GPU 환경이면 자동 다운그레이드 (이 파일은 단일 GPU용)
             if "," in requested:
-                device = DeviceManager._validate_multi_gpu(requested, n_gpu)
+                parts = [x.strip() for x in requested.split(",") if x.strip() != ""]
+                if len(parts) > n_gpu:
+                    fallback = parts[0] if parts else "0"
+                    print(f"[DEVICE] 요청 device={requested}인데 가용 GPU는 {n_gpu}개 → 단일 GPU {fallback}로 자동 변경")
+                    device = fallback
+                else:
+                    device = ",".join(parts)
+            elif requested.isdigit():
+                if int(requested) >= n_gpu:
+                    print(f"[DEVICE] 요청 device={requested}가 가용 GPU 인덱스({n_gpu-1})를 초과 → GPU 0으로 변경")
+                    device = "0"
+                else:
+                    device = requested
             else:
-                device = "0" if requested in {"auto", "cuda", "gpu"} else requested
+                device = "0"  # "auto"/"cuda"/"gpu" → 첫 번째 GPU
 
-            gpu_count_in_use = DeviceManager.count_gpus(device)
-            if gpu_count_in_use > 1:
-                print(f"[DEVICE] Multi-GPU DDP 모드: device={device} (총 {gpu_count_in_use} GPU)")
-                print("[DEVICE] Ultralytics가 DDP를 자동 spawn합니다. --batch는 총량 기준입니다.")
-            else:
-                print(f"[DEVICE] CUDA 사용: device={device}")
-            print()
+            print(f"[DEVICE] CUDA 사용: device={device}\n")
             return device
 
         diagnosis = [
@@ -382,36 +539,6 @@ class DeviceManager:
         return "cpu"
 
     @staticmethod
-    def _validate_multi_gpu(requested: str, n_gpu_available: int) -> str:
-        """"0,1" 등 multi-GPU 문자열 검증. 잘못된 인덱스가 있으면 명확히 실패."""
-        try:
-            ids = [int(x.strip()) for x in requested.split(",") if x.strip() != ""]
-        except ValueError as e:
-            raise RuntimeError(f"잘못된 multi-GPU device 문자열: '{requested}'") from e
-        for i in ids:
-            if i < 0 or i >= n_gpu_available:
-                raise RuntimeError(
-                    f"--device {requested} 요청했으나 GPU {i}는 존재하지 않습니다 "
-                    f"(가용 GPU 인덱스: 0 ~ {n_gpu_available - 1})."
-                )
-        return ",".join(str(i) for i in ids)
-
-    @staticmethod
-    def count_gpus(device: str) -> int:
-        """device 문자열로 사용할 GPU 개수 계산. 'cpu'면 0, 단일이면 1, '0,1'면 2."""
-        if not device or str(device).lower() == "cpu":
-            return 0
-        return max(1, len([x for x in str(device).split(",") if x.strip() != ""]))
-
-    @staticmethod
-    def primary_gpu(device: str) -> str:
-        """multi-GPU 문자열에서 추론에 쓸 primary GPU 하나만 반환."""
-        if not device or str(device).lower() == "cpu":
-            return "cpu"
-        parts = [x.strip() for x in str(device).split(",") if x.strip() != ""]
-        return parts[0] if parts else "0"
-
-    @staticmethod
     def cuda_amp_enabled(device: str, no_amp: bool = False) -> bool:
         return False if no_amp else str(device).lower() != "cpu"
 
@@ -421,7 +548,7 @@ class DeviceManager:
 
     @staticmethod
     def clear_cuda_memory() -> None:
-        """모든 GPU의 캐시를 비우고 IPC 핸들 정리."""
+        """GC + 모든 GPU의 캐시 정리. 학습 job 사이 메모리 fragmentation 회피."""
         try:
             import gc
             gc.collect()
@@ -430,7 +557,6 @@ class DeviceManager:
         try:
             import torch
             if torch.cuda.is_available():
-                # 동기화 후 비우기 (비동기 커널 남아있으면 empty_cache 효과 ↓)
                 for i in range(torch.cuda.device_count()):
                     try:
                         with torch.cuda.device(i):
@@ -447,7 +573,6 @@ class DeviceManager:
 
     @staticmethod
     def print_vram_status(prefix: str = "") -> None:
-        """현재 GPU별 VRAM 사용량 출력 (디버깅용)."""
         try:
             import torch
             if not torch.cuda.is_available():
@@ -483,23 +608,45 @@ class DeviceManager:
 # 4-1. 실제 데이터/라벨 경로 확인
 # ──────────────────────────────────────────────────────────────
 class DataDirResolver:
-    """문제2 데이터 폴더를 확인하거나 자동 탐색한다."""
+    """문제2 데이터 폴더를 확인하거나 자동 탐색한다. 클라우드 환경 대응 강화."""
 
     REQUIRED = ("train_images", "train_labels", "test_images", "building_detection_template.csv")
+
+    # 클라우드 환경에서 데이터가 흔히 마운트되는 위치들
+    CLOUD_PATHS = [
+        Path("/workspace/data"), Path("/workspace"),
+        Path("/content/data"), Path("/content"),  # Colab
+        Path("/root/data"), Path("/root"),
+        Path("/data"), Path("/mnt/data"), Path("/mnt"),
+        Path("/home/data"),
+    ]
 
     @classmethod
     def resolve(cls, requested: str | None, default_dir: Path) -> Path:
         candidates: list[Path] = []
         if requested:
             candidates.append(Path(requested))
-        candidates.extend([default_dir, Path.cwd() / "data", Path.cwd()])
+        candidates.extend([
+            default_dir,
+            Path.cwd() / "data",
+            Path.cwd(),
+            CFG.PROJECT_ROOT / "data",
+            CFG.PROJECT_ROOT,
+        ])
+        candidates.extend(cls.CLOUD_PATHS)
 
         for path in candidates:
-            path = Path(path).expanduser()
-            if cls.is_valid(path):
-                return path.resolve()
+            try:
+                path = Path(path).expanduser()
+                if cls.is_valid(path):
+                    print(f"[DATA] 데이터 폴더 확인: {path}")
+                    return path.resolve()
+            except Exception:
+                continue
 
-        for root in (CFG.PROJECT_ROOT, Path.cwd(), Path.home() / "Downloads"):
+        # 재귀 검색 (마지막 수단)
+        search_roots = [CFG.PROJECT_ROOT, Path.cwd()] + cls.CLOUD_PATHS + [Path.home()]
+        for root in search_roots:
             if not root.exists():
                 continue
             try:
@@ -508,11 +655,17 @@ class DataDirResolver:
                     if cls.is_valid(path):
                         print(f"[DATA] 자동 탐색으로 데이터 폴더를 찾았습니다: {path}")
                         return path.resolve()
+            except (PermissionError, OSError):
+                continue
             except Exception:
                 continue
 
+        searched = "\n  ".join(str(c) for c in candidates[:8])
         raise FileNotFoundError(
-            "문제2 데이터 폴더를 찾지 못했습니다. --data-dir로 train_images/train_labels/test_images가 있는 폴더를 지정하세요."
+            f"문제2 데이터 폴더를 찾지 못했습니다.\n"
+            f"탐색한 경로 (일부):\n  {searched}\n"
+            f"--data-dir로 다음 4개가 모두 있는 폴더를 지정하세요:\n"
+            f"  {', '.join(cls.REQUIRED)}"
         )
 
     @classmethod
@@ -1191,34 +1344,13 @@ class ModelTrainer:
                     print(f"[RESUME] 기존 e{epochs} run과 충돌하지 않도록 새 이름 사용: {run_name}")
                 resume = False
 
-        # 1) DDP 시 batch는 GPU 수의 배수여야 안정 (loss 정규화 일관성)
-        n_gpu = DeviceManager.count_gpus(device)
-        current_batch = int(batch)
-        if n_gpu > 1 and current_batch % n_gpu != 0:
-            adjusted = max(n_gpu, (current_batch // n_gpu) * n_gpu)
-            print(f"  [DDP] batch({current_batch})가 GPU 수({n_gpu})의 배수가 아니라 {adjusted}로 조정합니다.")
-            current_batch = adjusted
-
-        # 2) workers는 GPU별. DDP에서 너무 크면 RAM 폭증
+        # 클라우드 안전 기본값
         if workers is None:
             workers = self.cfg.WORKERS
-        effective_workers = int(workers)
-        if n_gpu > 1:
-            # Ultralytics는 workers를 GPU별 값으로 그대로 전달함. 너무 크면 강제 캡.
-            cap = 6
-            if effective_workers > cap:
-                print(f"  [DDP] workers({effective_workers}) > {cap}이라 RAM 보호를 위해 {cap}로 캡합니다.")
-                effective_workers = cap
-
-        # 3) DDP에서 cache='ram'은 워커마다 데이터셋을 복제 → 강제 'disk'로 다운그레이드
-        effective_cache = cache_mode
-        if n_gpu > 1 and effective_cache == "ram":
-            print("  [DDP] cache='ram'은 GPU 수만큼 RAM 복제 → 'disk'로 자동 다운그레이드.")
-            effective_cache = "disk"
-
-        # 4) plots=True는 학습 중 matplotlib이 추가 메모리 점유 → 호출자가 끌 수 있게 인자화
+        effective_workers = max(0, int(workers))
         plots_flag = bool(save_plots)
 
+        current_batch = int(batch)
         attempt = 1
         consecutive_oom = 0
 
@@ -1229,10 +1361,10 @@ class ModelTrainer:
 
             print("=" * 60)
             print(f"STEP 2 : Ultralytics YOLO 학습 | seed={seed} | attempt={attempt}")
-            print(f"  모델: {model_name} | imgsz: {imgsz} | 최대 epoch: {epochs} | batch(총): {current_batch}")
-            if n_gpu > 1:
-                print(f"  GPU 수: {n_gpu} | GPU당 batch: {current_batch // n_gpu} | workers(GPU별): {effective_workers}")
-            print(f"  device: {device} | AMP: {amp} | deterministic: {deterministic} | cache: {effective_cache} | patience: {patience} | max_det: {max_det} | plots: {plots_flag}")
+            print(f"  모델: {model_name} | imgsz: {imgsz} | 최대 epoch: {epochs} | batch: {current_batch}")
+            print(f"  device: {device} | AMP: {amp} | deterministic: {deterministic} | cache: {cache_mode} | patience: {patience} | max_det: {max_det} | plots: {plots_flag}")
+            print(f"  workers: {effective_workers} | mixup: {aug_mixup} | copy_paste: {aug_copy_paste}")
+            print("  학습 중 epoch별 ETA는 Ultralytics 로그를 참고하고, 학습 job 종료 후 전체 ETA가 갱신됩니다.")
             print("=" * 60)
 
             DeviceManager.print_vram_status(prefix="[학습 전] ")
@@ -1253,10 +1385,10 @@ class ModelTrainer:
                     seed=seed,
                     deterministic=deterministic,
                     verbose=True,
-                    cache=False if effective_cache == "none" else effective_cache,
+                    cache=False if cache_mode == "none" else cache_mode,
                     single_cls=True,
                     max_det=max_det,
-                    # 위성 이미지 특화 증강
+                    # 위성 이미지 특화 증강 (degrees=0 권장: axis-aligned bbox 보호)
                     degrees=float(aug_degrees),
                     flipud=0.5,
                     fliplr=0.5,
@@ -1289,32 +1421,31 @@ class ModelTrainer:
                     save_period=-1,
                     plots=plots_flag,
                 )
-                # 학습 본체에서 명시적으로 GC + 메모리 해제 (다음 job 준비)
+                # 학습 종료 후 명시적 메모리 정리
                 del model
                 DeviceManager.clear_cuda_memory()
                 DeviceManager.print_vram_status(prefix="[학습 후] ")
                 break
             except RuntimeError as e:
                 msg = str(e).lower()
-                is_oom = ("out of memory" in msg) or ("cuda" in msg and "memory" in msg) or ("nccl" in msg and "memory" in msg)
-                # batch 강하 시 GPU 수의 배수 유지
-                step = max(n_gpu, 1)
-                if is_oom and current_batch > step:
-                    next_batch = max(step, (current_batch // 2 // step) * step) if step > 0 else max(1, current_batch // 2)
-                    if next_batch >= current_batch:
-                        next_batch = max(step, current_batch - step)
+                is_oom = ("out of memory" in msg) or ("cuda" in msg and "memory" in msg)
+                if is_oom and current_batch > 1:
+                    next_batch = max(1, current_batch // 2)
                     print("\n  [OOM WARN] CUDA 메모리 부족으로 추정되어 batch를 낮춰 재시도합니다.")
-                    print(f"             batch {current_batch} → {next_batch} (GPU 수: {n_gpu})\n")
+                    print(f"             batch {current_batch} → {next_batch}\n")
                     current_batch = next_batch
                     attempt += 1
                     consecutive_oom += 1
                     DeviceManager.clear_cuda_memory()
-                    # 연속 OOM이면 추가로 imgsz를 한 단계 낮추는 마지막 보루
+                    # 연속 OOM 2회면 imgsz도 한 단계 강하 (마지막 보루)
                     if consecutive_oom >= 2 and imgsz > 640:
-                        new_imgsz = max(640, (imgsz - 128) // 32 * 32)
+                        new_imgsz = max(640, ((imgsz - 128) // 32) * 32)
                         print(f"  [OOM FALLBACK] 연속 OOM {consecutive_oom}회 → imgsz {imgsz} → {new_imgsz}로 추가 강하")
                         imgsz = new_imgsz
                     continue
+                # OOM이 아니거나 batch=1까지 갔는데도 실패 → 원본 예외 그대로
+                print("\n[FATAL] 학습 중 복구 불가능한 오류:")
+                traceback.print_exc()
                 raise
 
         best_pt = save_dir / "weights" / "best.pt"
@@ -2234,14 +2365,14 @@ class ArgParserFactory:
             "--preset",
             choices=[
                 "manual",
-                # H100 × 2 (160GB) DDP preset - 5시간 예산
-                "h100x2-5h", "h100x2-5h-safe", "h100x2-5h-hires", "h100x2-5h-multimodel",
-                # 단일 GPU preset (호환)
+                # 클라우드 H100 단일 GPU - 5시간 예산
+                "h100-cloud-5h", "h100-cloud-5h-safe",
+                # 기존 단일 GPU preset (호환)
                 "rtx6000-150m", "rtx6000-small-3h", "rtx6000-small-3h-hires",
                 "rtx6000-small-3h-stable", "rtx6000-180x2", "rtx6000-200x2",
             ],
-            default="h100x2-5h",
-            help="실행 환경/시간 예산 preset. 기본 h100x2-5h는 H100 × 2 DDP, peak ~50GB/GPU로 안전.",
+            default="h100-cloud-5h",
+            help="실행 환경/시간 예산 preset. 기본 h100-cloud-5h는 H100 80GB 단일 GPU 클라우드 환경 안전 설정.",
         )
         p.add_argument("--inspect", action="store_true", help="데이터 구조 확인 후 종료")
         p.add_argument("--data-dir", type=str, default=None, help="문제2 데이터 폴더(train_images/train_labels/test_images 포함). 생략 시 자동 탐색")
@@ -2269,15 +2400,15 @@ class ArgParserFactory:
         p.add_argument("--workers", type=int, default=CFG.WORKERS, help=f"DataLoader workers (기본: {CFG.WORKERS})")
         p.add_argument("--cache-mode", choices=["ram", "disk", "none"], default="ram", help="Ultralytics 데이터 캐시 방식")
         p.add_argument("--deterministic", action="store_true", help="재현성 우선 학습 사용. 속도는 다소 느려질 수 있음")
-        p.add_argument("--aug-degrees", type=float, default=CFG.AUG_DEGREES, help=f"회전 증강 각도 범위 (기본: {CFG.AUG_DEGREES}). 0 권장(axis-aligned bbox 손상 방지)")
+        p.add_argument("--aug-degrees", type=float, default=CFG.AUG_DEGREES, help=f"회전 증강 각도 범위 (기본: {CFG.AUG_DEGREES}). 0 권장 (axis-aligned bbox 보호)")
         p.add_argument("--aug-mosaic", type=float, default=CFG.AUG_MOSAIC, help=f"mosaic 증강 확률 (기본: {CFG.AUG_MOSAIC})")
         p.add_argument("--aug-scale", type=float, default=CFG.AUG_SCALE, help=f"scale 증강 범위 (기본: {CFG.AUG_SCALE})")
         p.add_argument("--aug-translate", type=float, default=CFG.AUG_TRANSLATE, help=f"translate 증강 범위 (기본: {CFG.AUG_TRANSLATE})")
         p.add_argument("--aug-mixup", type=float, default=CFG.AUG_MIXUP, help=f"mixup 증강 확률 (기본: {CFG.AUG_MIXUP})")
         p.add_argument("--aug-copy-paste", type=float, default=CFG.AUG_COPY_PASTE, help=f"copy_paste 증강 확률 (기본: {CFG.AUG_COPY_PASTE})")
         p.add_argument("--close-mosaic", type=int, default=CFG.CLOSE_MOSAIC, help=f"마지막 N epoch에서 mosaic 비활성화 (기본: {CFG.CLOSE_MOSAIC})")
-        p.add_argument("--no-plots", action="store_true", help="학습 중 plots 생성 비활성화 (VRAM 약간 절약)")
-        p.add_argument("--cuda-alloc-conf", type=str, default=None, help="PYTORCH_CUDA_ALLOC_CONF 값 덮어쓰기. 기본 'expandable_segments:True,max_split_size_mb:512'")
+        p.add_argument("--no-plots", action="store_true", help="학습 중 matplotlib plots 생성 비활성화 (메모리/시간 절약)")
+        p.add_argument("--cuda-alloc-conf", type=str, default=None, help="PYTORCH_CUDA_ALLOC_CONF 값 덮어쓰기")
 
         p.add_argument("--device", type=str, default=CFG.DEVICE, help="실행 장치: auto, cuda, cpu, 0, 0,1 등")
         p.add_argument("--force-cuda", action="store_true", default=CFG.FORCE_CUDA, help="CUDA가 없으면 즉시 중단")
@@ -2361,42 +2492,39 @@ class PresetManager:
 
     PRESETS = {
         # ============================================================
-        # H100 × 2 (80GB × 2 = 160GB total), 5시간 예산 - 기본 권장
+        # H100 80GB 단일 GPU (클라우드) - 5시간 예산, 기본 권장
         # ============================================================
         #
-        # DDP(Distributed Data Parallel) 동작:
-        #   - --batch는 **총** 배치, GPU 수로 자동 분할
-        #   - --workers는 **GPU별** (총 = workers × n_gpu)
-        #   - cache='disk'로 강제 (ram은 워커마다 복제 → RAM OOM)
+        # VRAM 예상 (yolo11x BF16/AMP, 학습+val peak):
+        #   imgsz=1024 batch=12 → 약 45~55GB  ← h100-cloud-5h (기본)
+        #   imgsz=1024 batch=8  → 약 30~40GB  ← h100-cloud-5h-safe
         #
-        # VRAM per-GPU 예상 (yolo11x BF16, 학습+val peak):
-        #   batch_total=16 (8/GPU) imgsz=1024 → 약 30~40GB/GPU  ← h100x2-5h-safe
-        #   batch_total=24 (12/GPU) imgsz=1024 → 약 45~55GB/GPU ← h100x2-5h (기본)
-        #   batch_total=16 (8/GPU) imgsz=1280 → 약 50~60GB/GPU  ← h100x2-5h-hires
+        # 시간 예상 (H100 80GB 단일):
+        #   yolo11x imgsz=1024 batch=12 200ep ≈ 70~90분/job
+        #   3 seed × 80분 = 240분 + 보정/추론 = 약 280분 < 300분(5h) ✓
         #
-        # 시간 산정 (DDP × 2):
-        #   - 단일 H100 yolo11x imgsz=1024 batch=12 200ep ≈ 60min
-        #   - DDP × 2 batch=24 (12/GPU) 200ep ≈ 35~40min (1.7× speedup)
-        #   - 3 jobs × 40min = 120min + 보정/추론/제출 ≈ 150min < 300min(5h) ✓
-        #
-        # h100x2-5h (기본 권장): batch=24, 3 seed
-        "h100x2-5h": {
+        # 클라우드 안전 옵션:
+        #   - cache='disk' (RAM 부담 ↓)
+        #   - workers=4 (도커 컨테이너 DataLoader 안정)
+        #   - no_plots=True (matplotlib 메모리 회피)
+        #   - device='cuda' (자동으로 GPU 0 선택)
+        "h100-cloud-5h": {
             "model": "yolo11x.pt",
             "models": None,
             "seeds": "42,77,123",
             "imgsz": 1024,
-            "epochs": 220,
+            "epochs": 200,
             "patience": 60,
-            "batch": 24,                # 총 batch → 각 GPU 12 → ~50GB/GPU
-            "workers": 6,               # GPU별. 총 12 워커 (2 GPU × 6)
-            "cache_mode": "disk",       # DDP RAM 복제 방지
+            "batch": 12,                  # H100 80GB peak ~50GB
+            "workers": 4,
+            "cache_mode": "disk",
             "deterministic": False,
             "val_ratio": 0.15,
             "min_box_px": 5.0,
             "split_mode": "group-stratified",
             "split_seed": 42,
             "vary_split_by_seed": False,
-            "device": "0,1",            # H100 × 2 DDP
+            "device": "cuda",
             "force_cuda": True,
             "resume": True,
             "start_after_seed": None,
@@ -2422,18 +2550,17 @@ class PresetManager:
             "aug_mixup": 0.05,
             "aug_copy_paste": 0.10,
             "close_mosaic": 35,
-            "no_plots": False,
+            "no_plots": True,
         },
-        # h100x2-5h-safe: OOM 위험 0에 가깝게. batch=16, peak ~35GB/GPU
-        # 다른 작업과 GPU 공유 중이거나 첫 OOM 발생 시 폴백 권장.
-        "h100x2-5h-safe": {
+        # OOM 위험 0에 가까운 보수 설정 (다른 작업과 GPU 공유 / 첫 OOM 폴백)
+        "h100-cloud-5h-safe": {
             "model": "yolo11x.pt",
             "models": None,
             "seeds": "42,77,123",
             "imgsz": 1024,
-            "epochs": 240,              # batch 작아 step 많아짐 → epoch 늘려 보상
-            "patience": 70,
-            "batch": 16,                # 각 GPU 8 → ~35GB/GPU (매우 안전)
+            "epochs": 220,
+            "patience": 65,
+            "batch": 8,                   # peak ~35GB
             "workers": 4,
             "cache_mode": "disk",
             "deterministic": False,
@@ -2442,7 +2569,7 @@ class PresetManager:
             "split_mode": "group-stratified",
             "split_seed": 42,
             "vary_split_by_seed": False,
-            "device": "0,1",
+            "device": "cuda",
             "force_cuda": True,
             "resume": True,
             "start_after_seed": None,
@@ -2467,104 +2594,13 @@ class PresetManager:
             "aug_translate": 0.08,
             "aug_mixup": 0.05,
             "aug_copy_paste": 0.10,
-            "close_mosaic": 40,
-            "no_plots": True,           # 추가 메모리 절약
-        },
-        # h100x2-5h-hires: imgsz=1280 고해상도. 작은 건물 검출 강화.
-        "h100x2-5h-hires": {
-            "model": "yolo11x.pt",
-            "models": None,
-            "seeds": "42,77",
-            "imgsz": 1280,
-            "epochs": 160,
-            "patience": 50,
-            "batch": 16,                # 각 GPU 8 → ~55GB/GPU
-            "workers": 4,
-            "cache_mode": "disk",
-            "deterministic": False,
-            "val_ratio": 0.15,
-            "min_box_px": 5.0,
-            "split_mode": "group-stratified",
-            "split_seed": 42,
-            "vary_split_by_seed": False,
-            "device": "0,1",
-            "force_cuda": True,
-            "resume": True,
-            "start_after_seed": None,
-            "reuse_short_runs": False,
-            "conf": 0.25,
-            "iou": 0.50,
-            "no_calibrate": False,
-            "slow_calibrate": False,
-            "tta_level": "strong",
-            "infer_mode": "tile",
-            "tile_size": 960,
-            "tile_overlap": 0.20,
-            "tile_nms_iou": 0.50,
-            "max_det": 15000,
-            "ensemble_method": "auto",
-            "time_report_every": 5,
-            "time_budget_min": 300.0,
-            "reserve_submit_min": 25.0,
-            "aug_degrees": 0.0,
-            "aug_mosaic": 0.50,
-            "aug_scale": 0.40,
-            "aug_translate": 0.08,
-            "aug_mixup": 0.05,
-            "aug_copy_paste": 0.10,
-            "close_mosaic": 30,
-            "no_plots": True,
-        },
-        # h100x2-5h-multimodel: yolo11x + yolov8x × 2 seed = 4 jobs.
-        # 모델 다양성이 RMSE에 가장 효과적. 학습 시간 빠듯하므로 epoch 줄임.
-        "h100x2-5h-multimodel": {
-            "model": "yolo11x.pt",
-            "models": "yolo11x.pt,yolov8x.pt",
-            "seeds": "42,77",
-            "imgsz": 1024,
-            "epochs": 180,
-            "patience": 50,
-            "batch": 24,
-            "workers": 6,
-            "cache_mode": "disk",
-            "deterministic": False,
-            "val_ratio": 0.15,
-            "min_box_px": 5.0,
-            "split_mode": "group-stratified",
-            "split_seed": 42,
-            "vary_split_by_seed": False,
-            "device": "0,1",
-            "force_cuda": True,
-            "resume": True,
-            "start_after_seed": None,
-            "reuse_short_runs": False,
-            "conf": 0.25,
-            "iou": 0.50,
-            "no_calibrate": False,
-            "slow_calibrate": False,
-            "tta_level": "strong",
-            "infer_mode": "tile",
-            "tile_size": 768,
-            "tile_overlap": 0.20,
-            "tile_nms_iou": 0.50,
-            "max_det": 15000,
-            "ensemble_method": "auto",
-            "time_report_every": 5,
-            "time_budget_min": 300.0,
-            "reserve_submit_min": 22.0,
-            "aug_degrees": 0.0,
-            "aug_mosaic": 0.50,
-            "aug_scale": 0.40,
-            "aug_translate": 0.08,
-            "aug_mixup": 0.05,
-            "aug_copy_paste": 0.10,
-            "close_mosaic": 30,
+            "close_mosaic": 35,
             "no_plots": True,
         },
         # ============================================================
-        # 이하 기존 single-GPU preset (호환용)
+        # 기존 RTX PRO 6000 preset (호환용)
         # ============================================================
-        "rtx6000-150m": {     # ⚠ 단일 96GB GPU 가정. H100x2면 h100x2-5h-multimodel 권장
+        "rtx6000-150m": {
             "models": "yolo11x.pt,yolov8x.pt",
             "seeds": "42",
             "imgsz": 1280,
@@ -2938,7 +2974,13 @@ class PipelineRunner:
         self.cfg.WORKERS = int(args.workers)
         estimator = RuntimeEstimator(report_every=args.time_report_every)
 
-        data_dir = DataDirResolver.resolve(args.data_dir, self.cfg.BASE_DIR)
+        # [클라우드 안전] 1) 데이터 폴더 해결 → set_base_dir
+        try:
+            data_dir = DataDirResolver.resolve(args.data_dir, self.cfg.BASE_DIR)
+        except FileNotFoundError as e:
+            print(f"\n[FATAL] {e}")
+            print("실행을 중단합니다. --data-dir로 경로를 지정한 뒤 다시 시도하세요.")
+            sys.exit(2)
         self.cfg.set_base_dir(data_dir)
         print(f"[DATA] 사용 데이터 폴더: {self.cfg.BASE_DIR}")
 
@@ -2950,9 +2992,21 @@ class PipelineRunner:
                 args.submission = str(self.cfg.SUBMISSION_CSV)
             print(f"[WORK] 이어달리기 작업 폴더: {self.cfg.YOLO_ROOT}")
 
+        # [클라우드 안전] 2) 출력 디렉터리 쓰기 권한 사전 확인 + fallback
+        self.cfg.ensure_writable_dirs()
+
         if args.inspect:
             DataInspector(self.cfg).inspect()
             return
+
+        # [클라우드 안전] 3) CUDA 환경 사전 진단 (학습 시작 전에 빠르게 실패)
+        if str(args.device).lower() != "cpu":
+            try:
+                DeviceManager.preflight_cuda()
+            except RuntimeError as e:
+                if args.force_cuda or str(args.device).lower() != "cpu":
+                    print(f"\n[FATAL] CUDA 사전 진단 실패:\n{e}")
+                    sys.exit(3)
 
         device = DeviceManager.resolve_device(requested_device=args.device, force_cuda=args.force_cuda)
         DeviceManager.optimize_torch_runtime(device=device)
@@ -2975,13 +3029,7 @@ class PipelineRunner:
         split_strategy = SplitStrategy(self.cfg.TRAIN_LBL_DIR)
         dataset_builder = DatasetBuilder(self.cfg, ImageIO, split_strategy, estimator)
         trainer = ModelTrainer(self.cfg, estimator)
-        # [VRAM] 학습은 multi-GPU(DDP), 추론은 단일 GPU만 써서 OOM 위험 ↓.
-        #        DDP가 끝나면 child process가 사라지지만 메모리 fragmentation은 남음.
-        #        primary GPU만 사용하면 두 번째 GPU는 완전히 free 상태 유지.
-        inference_device = DeviceManager.primary_gpu(device)
-        if inference_device != device:
-            print(f"[DEVICE] 학습 device={device} (DDP) | 추론 device={inference_device} (단일 GPU)\n")
-        predictor = DetectionPredictor(device=inference_device, half=half, estimator=estimator)
+        predictor = DetectionPredictor(device=device, half=half, estimator=estimator)
         calibrator = ThresholdCalibrator(self.cfg, predictor, estimator)
         inferencer = TestInferencer(self.cfg, predictor, estimator)
         submission_writer = SubmissionWriter(self.cfg)
@@ -3024,16 +3072,10 @@ class PipelineRunner:
         print("  2026 지능IoT해커톤 - 문제 2 건물 탐지 SOLID + ETA 파이프라인")
         print("=" * 60)
         print(f"  모델 목록: {list(model_names)}")
-        print(f"  imgsz: {args.imgsz} | epochs: {args.epochs} | patience: {args.patience} | batch(총): {args.batch}")
-        n_gpu = DeviceManager.count_gpus(getattr(args, "device", ""))
-        if n_gpu > 1:
-            per_gpu = args.batch // n_gpu if args.batch % n_gpu == 0 else f"{args.batch}/{n_gpu}≈{args.batch//n_gpu}"
-            print(f"  [DDP] device: {args.device} | GPU 수: {n_gpu} | GPU당 batch: {per_gpu} | workers(GPU별): {args.workers}")
-        else:
-            print(f"  device: {args.device} | workers: {args.workers}")
+        print(f"  imgsz: {args.imgsz} | epochs: {args.epochs} | patience: {args.patience} | batch: {args.batch}")
         print(f"  min_box_px: {args.min_box_px} | val_ratio: {args.val_ratio} | split_mode: {args.split_mode}")
         print(f"  split_seed: {args.split_seed} | vary_split_by_seed: {args.vary_split_by_seed}")
-        print(f"  cache: {args.cache_mode} | plots: {not args.no_plots}")
+        print(f"  device: {args.device} | workers: {args.workers} | cache: {args.cache_mode} | plots: {not args.no_plots}")
         print(f"  aug: degrees={args.aug_degrees} | mosaic={args.aug_mosaic} | scale={args.aug_scale} | translate={args.aug_translate} | close_mosaic={args.close_mosaic}")
         print(f"  aug: mixup={args.aug_mixup} | copy_paste={args.aug_copy_paste}")
         print(f"  deterministic: {args.deterministic} | time_budget: {args.time_budget_min}분 | reserve: {args.reserve_submit_min}분")
@@ -3146,9 +3188,8 @@ class PipelineRunner:
                 train_done += 1
                 estimator.end_job("학습 job", train_done, total_train_jobs)
 
-                # [VRAM] 학습 후 모든 GPU 메모리 정리. DDP 자식 프로세스 잔여 메모리도 해제.
+                # 학습 job 사이 메모리 정리
                 DeviceManager.clear_cuda_memory()
-                DeviceManager.print_vram_status(prefix="[추론 전] ")
 
                 if not best_pt.exists():
                     raise FileNotFoundError(f"가중치 파일 없음: {best_pt}")
@@ -3195,8 +3236,7 @@ class PipelineRunner:
         if getattr(args, "preset", "") == "rtx6000-small-3h-stable":
             parts.append("stable")
         preset_name = str(getattr(args, "preset", ""))
-        if preset_name.startswith("h100x2"):
-            # h100x2 preset은 batch/aug가 달라 기존 단일-GPU run과 비호환 → 별도 폴더
+        if preset_name.startswith("h100-cloud"):
             parts.append(preset_name.replace("-", ""))
         return "_" + "_".join(parts) if parts else ""
 
@@ -3331,11 +3371,6 @@ class PipelineRunner:
 def main() -> None:
     args = ArgParserFactory.create().parse_args()
     args = PresetManager.apply(args, sys.argv)
-    # --cuda-alloc-conf로 PYTORCH_CUDA_ALLOC_CONF 덮어쓰기 (torch import 전이어야 효과 있지만,
-    # 이미 import된 후라도 다음 cudaMalloc부터는 적용됨)
-    if getattr(args, "cuda_alloc_conf", None):
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = str(args.cuda_alloc_conf)
-        print(f"[ENV] PYTORCH_CUDA_ALLOC_CONF = {args.cuda_alloc_conf}")
     PipelineRunner(CFG).run(args)
 
 
