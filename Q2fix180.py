@@ -230,13 +230,13 @@ class CFG:
     # 학습 (클라우드 H100 단일 GPU 안전치)
     MODEL = "yolo11x.pt"
     EPOCHS = 200
-    BATCH = 12                  # H100 80GB에서 peak ~50GB로 안전
+    BATCH = 8                  # H100 80GB에서 peak ~50GB로 안전
     PATIENCE = 50
     WORKERS = 4                 # 클라우드 컨테이너 DataLoader 안정성
     DEVICE = "auto"
     FORCE_CUDA = False
     AMP = True
-    MAX_DET = 15000             # [수정] 30000→15000: val NMS 메모리 안전
+    MAX_DET = 10000             # [수정] 30000→15000: val NMS 메모리 안전
     TIME_BUDGET_MIN = 0.0
     RESERVE_SUBMIT_MIN = 20.0
 
